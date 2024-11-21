@@ -1,511 +1,251 @@
---#region Tokenizer
-local letters_symbols = {}
-
--- ASCII values for A-Z
-for i = 65, 90 do
-    table.insert(letters_symbols, string.char(i))
-end
-
--- ASCII values for a-z
-for i = 97, 122 do
-    table.insert(letters_symbols, string.char(i))
-end
-
--- Common symbols
-local common_symbols = { '!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/',
-    ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '{', '|', '}', '~' }
-for _, symbol in ipairs(common_symbols) do
-    table.insert(letters_symbols, symbol)
-end
-
-local ttypes = {
-    lparen = "lparen",
-    string = "string",
-    id = "id",
-    any = nil
+---@class Bundler
+local Bundler = {
+    _cwd = '',
+    _config = {},
+    _separator = '/',
+    _prefixsymb = '_G.',
+    _postfixsymb = '__',
+    _cmt_cmd_prefix = '--!',
+    _out = {},
+    _entryfile = {},
+    _cmds = {
+        skip = 'skip',
+        endskip = 'endskip'
+    },
+    _reg = {
+        emptyline = '^%s*$',
+        spacecomment = '^%s*--%s*.*',
+        space = '^%s*(.-)%s*$',
+        require = {
+            noparenthesis = "require%s*%s*['\"]([^'\"]+)['\"]",
+            parenthesis = "require%s*%s*%(['\"]([^'\"]+)['\"]%)"
+        },
+    }
 }
 
----@alias RequireTypes 'eager' | 'lazy'
----@alias Token { type: string, value: string }
----@alias ReqTypes { eager: string[], lazy: string[] }
+function Bundler:bundle(pwd, entrypoint, out, config)
+    self:_initialize(pwd, entrypoint, out, config)
 
----@class Tokenizer
----@field _path string
----@field _code string
----@field _file file*
----@field _cursor number
----@field _cchar string
----@field _tokens Token[]
----@field _expect_comment_close boolean
----@field _rawcode string
----@field _letters_symbols string[]
-local Tokenizer = { code = '', cursor = 1, cchar = '', tokens = {} }
-Tokenizer.__index = Tokenizer
+    local skip = 0
+    local collected_paths = {}
+    local files_queue = { self._entryfile }
 
----@param path string
----@return Tokenizer
-function Tokenizer:new(path)
-    local o = setmetatable({
-        _path = path,
-        _code = '',
-        _cursor = 1,
-        _cchar = '',
-        _tokens = {},
-        _expect_comment_close = false,
-        _rawcode = '',
-        _file = self:_get_file(path),
-        _letters_symbols = letters_symbols,
-    }, Tokenizer)
-    o:_tokenize()
-    return o
-end
+    self:_write_cmt_cmd(self._cmds.skip)
+    self._out:write('_G.__LOADED = {}\n')
+    self:_write_cmt_cmd(self._cmds.endskip)
 
----@return Token[]
-function Tokenizer:_tokenize()
-    for v in self._file:lines() do
-        self._code = v
-        self._cursor = 1
-        self._cchar = self._code:sub(1, 1)
-        self._rawcode = self._rawcode .. '\n' .. v
+    while #files_queue > 0 do
+        local data = table.remove(files_queue, #files_queue)
+        local expect_comment_close = false
+        local mod_name = self:_path_to_name(self._config.libname or data.path)
 
-        while self._cursor <= #self._code do
-            if self._cursor > #self._code then break end
+        self:_write_mod_header(mod_name)
 
-            if self:_is_comment() then
-                break
-            end
+        for rawline in data.file:lines() do
+            -- All processing must use trimmed
+            local line = rawline:match(self._reg.space)
 
-            if self:_is_alpha(self._cchar) then
-                local id = self:_read_identifier()
-                self:_push_token(ttypes.id, id)
-            end
-
-            if self._cchar == '"' or self._cchar == "'" then
-                local str = self:_create_string(self._cchar)
-                self:_push_token(ttypes.string, str)
-            end
-
-            if self:_includes_char(self.cchar) then
-                self:_push_token(ttypes.any, self._cchar)
-            end
-            self:_next()
-        end
-
-        if not self._expect_comment_close and #self._tokens > 1 then
-            self:_push_token(ttypes.any, '\n')
-        end
-    end
-
-    return self._tokens
-end
-
----@param path string
----@return file*
-function Tokenizer:_get_file(path)
-    local file = io.open(path, "r")
-    if not file then
-        error("\nCould not open file: " .. path)
-    end
-    return file
-end
-
----@return string
-function Tokenizer:to_str()
-    return self._rawcode
-end
-
-function Tokenizer:close()
-    self._file:close()
-end
-
----@return ReqTypes
-function Tokenizer:classify_requires()
-    local eager = {}
-    local lazy = {}
-    local is_lazy = false
-    local tokens = self._tokens
-
-    for i = 1, #tokens do
-        local token = tokens[i]
-
-        if token.type then
-            if token.value == "function" then
-                is_lazy = true
-            elseif token.value == "end" then
-                is_lazy = false
-            elseif token.value == "for" or token.value == "while" or token.value == "repeat" then
-                is_lazy = true
-            elseif token.value == "end" then
-                is_lazy = false
-            elseif token.value == "require" then
-                local tkn = tokens[i + 1]
-                local require_value = tkn.value
-
-                if tkn.type == ttypes.lparen then
-                    require_value = tokens[i + 2].value
+            if self:_starts_with(line, '--!') then
+                if self:_match_cmt_cmd(self._cmds.skip, line) then
+                    skip = skip + 1
+                    goto continue
                 end
 
-                if not is_lazy then
-                    table.insert(eager, require_value)
-                else
-                    table.insert(lazy, require_value)
+                if self:_match_cmt_cmd(self._cmds.endskip, line) then
+                    skip = skip - 1
+                    goto continue
                 end
             end
+
+            if skip ~= 0 then
+                goto continue
+            end
+
+            if expect_comment_close then
+                local pos = line:find(']]')
+                if pos then
+                    if pos == 1 or line:sub(pos - 1, pos - 1) ~= '\\' then
+                        expect_comment_close = false
+                    end
+                end
+                goto continue
+            end
+
+            local iscomment = self:_starts_with(line, '--')
+            local isempty = line:match(self._reg.emptyline) ~= nil
+
+            if iscomment or isempty then
+                if self:_starts_with(line, '--[[') then
+                    expect_comment_close = true
+                end
+                goto continue
+            end
+
+            -- Check for require statements
+            local path = line:match(self._reg.require.noparenthesis) or line:match(self._reg.require.parenthesis)
+            if path then
+                local ospath = self:_path_fixer(path)
+
+                if not collected_paths[path] then
+                    collected_paths[path] = true
+                    if self:_file_exists(ospath) then
+                        table.insert(files_queue, {
+                            path = path,
+                            file = io.open(ospath)
+                        })
+                    end
+                end
+
+                if self:_file_exists(ospath) then
+                    local name = self:_path_to_name(path)
+                    line = (line
+                        :gsub("require%s*%(%s*['\"]([^'\"]+)['\"]%s*%)", name)
+                        :gsub("require%s+['\"]([^'\"]+)['\"]", name)
+                        :gsub("require%s+([%w_%.]+)", name)) .. '()'
+                end
+            end
+
+            self._out:write(line .. '\n')
+            ::continue::
         end
+
+        skip = 0
+        data.file:close()
+        self:_write_mod_footer(mod_name)
     end
 
-    return {
-        eager = eager,
-        lazy = lazy
+    self:_write_cmt_cmd(self._cmds.skip)
+    self._out:write('return ' .. self._prefixsymb .. (self._config.libname or 'main') .. self._postfixsymb .. '()\n')
+    self:_write_cmt_cmd(self._cmds.endskip)
+    self._out:close()
+end
+
+function Bundler:_initialize(pwd, entrypoint, out, config)
+    self._cwd = pwd
+    self._config = config or {}
+    if self:_is_windows() then
+        self._separator = '\\'
+    end
+    self._out = io.open(out, 'a') --[[ @as file* ]]
+    self._entryfile = {
+        path = 'main',
+        file = io.open(pwd .. self._separator .. entrypoint, 'r')
     }
 end
 
----@param delimiter string
----@return string
-function Tokenizer:_create_string(delimiter)
-    self:_next()
-    local str = ''
-
-    while self._cchar ~= delimiter do
-        str = str .. self._cchar
-        self:_next()
-    end
-
-    return str
-end
-
----@param char string
----@return boolean
-function Tokenizer:_is_alpha(char)
-    local result = char:match("%a") ~= nil
-    return result
-end
-
----@param char string
----@return boolean
-function Tokenizer:_is_number(char)
-    local result = char:match("%d") ~= nil
-    return result
-end
-
----@return string
-function Tokenizer:_next()
-    if self._cursor > #self._code + 10 then
-        error("\nCursor beyond the limit: " .. self._cursor .. ' -- ' .. #self._code)
-    end
-    self._cursor = self._cursor + 1
-    self._cchar = self._code:sub(self._cursor, self._cursor)
-    return self._cchar
-end
-
----@return string
-function Tokenizer:_read_identifier()
-    local identifier = ''
-
-    while self:_is_alpha(self._cchar) or self:_is_number(self._cchar) do
-        identifier = identifier .. self._cchar
-        self:_next()
-    end
-
-    return identifier
-end
-
----@return string
-function Tokenizer:_read_number()
-    local allow_dot = true
-    local number = ''
-
-    while self:_is_number(self._code:sub(self._cursor, self._cursor)) or self._cchar ==
-        '.' do
-        if self._cchar == '.' and allow_dot then
-            allow_dot = false
-            number = number .. '.'
-            self:_next()
-        end
-        number = number .. self._cchar
-        self:_next()
-    end
-    return number
-end
-
----@return boolean
-function Tokenizer:_is_comment()
-    while self._expect_comment_close and self._cursor <= #self._code do
-        if self._cchar == ']' then
-            self:_next() -- Skip the first ']'
-            self:_next() -- Skip the second ']'
-            self._expect_comment_close = false
-            break
-        end
-        if self._expect_comment_close then
-            self:_next()
-        end
-    end
-
-
-    if self._expect_comment_close then
-        return true
-    end
-
-    if self._cchar == '-' and self:_peek() == '-' then
-        self:_next() -- Skip the first '-'
-        self:_next() -- Skip the second '-'
-
-        if self._cchar == '[' and self:_peek() == '[' then
-            self._expect_comment_close = true
-        end
-
-        return true
-    end
-
-    return false
-end
-
----@return string
-function Tokenizer:_peek()
-    local result = self._code:sub(self._cursor + 1, self._cursor + 1)
-    return result
-end
-
----@param type string
----@param value string
-function Tokenizer:_push_token(type, value)
-    table.insert(self._tokens, { type = type, value = value })
-end
-
----@param char string
----@return boolean
-function Tokenizer:_includes_char(char)
-    for _, c in ipairs(self._letters_symbols) do
-        if c == char then
-            return true
-        end
-    end
-    return false
-end
-
---#endregion
-
---#region Bundler
-local Bundler = {
-    _cwd = '',
-    _result_file_path = '',
-    _collected_modules = {},
-    _modules = {
-        lazy = {},
-        eager = {},
-    },
-    _bundle_header = [[
-_G.__oreq__ = require
-_G.__bundleregister__ = {
-    eager = {},
-    lazy = {},
-}
-function _G.__registerdepeager__(path, fn) __bundleregister__.eager[path] = fn() end
-function _G.__registerdeplazy__(path, fn) __bundleregister__.lazy[path] = fn() end
-require = function(path)
-    if __bundleregister__.eager[path] then return __bundleregister__.eager[path] end
-    if __bundleregister__.lazy[path] then return __bundleregister__.lazy[path]() end
-    local dep = __oreq__(path)
-    -- if dep then __bundleregister__[path] = dep end
-    if dep then __bundleregister__.eager[path] = dep end
-    return dep
-end
-]],
-    _eager_module = [[
-__registerdepeager__("{importpath}", function()
-    {code}
-end)
-]],
-    _lazy_module = [[
-__registerdeplazy__("{importpath}", function()
-    return function()
-        {code}
-    end
-end)
-]],
-}
-
-function Bundler:_init()
-    self._cwd = self:_getcwd()
-    self._result_file_path = self:_path_join({ self._cwd, 'bundle.lua' })
-    local path = arg[1]
-    local entrypoint = self:_path_join({ self._cwd, path })
-
-    self:_bundle(entrypoint)
-
-    local code = self._collected_modules[entrypoint]:to_str()
-    self:_process_write('__entrypoint__', code, entrypoint, 'eager')
-    self:_write_to_file(self._result_file_path, self._bundle_header)
-
-    for _, v in pairs(self._collected_modules) do
-        v:close()
-    end
-
-    print('\nDone. \nOutput path: ' .. self._result_file_path)
-end
-
----@param path string
-function Bundler:_bundle(path)
-    if self:_file_exists(path) then
-        local tokenizer = self:_get_tokenizer(path)
-        local requires = tokenizer:classify_requires()
-
-        ---@param reqpath string
-        ---@param mode RequireTypes
-        local function process_require(reqpath, mode)
-            local file_os_path = self:_path_join({ self._cwd, self:_path_fixer(reqpath) .. '.lua' })
-            if not self._collected_modules[file_os_path] then
-                table.insert(self._modules[mode], file_os_path)
-                self:_bundle(file_os_path)
-
-                if self:_file_exists(file_os_path) then
-                    local tkz = self:_get_tokenizer(file_os_path)
-                    self:_process_write(reqpath, tkz:to_str(), file_os_path, mode)
-                end
-            end
-        end
-
-        for _, v in pairs(requires.eager) do
-            process_require(v, 'eager')
-        end
-
-        for _, v in pairs(requires.lazy) do
-            process_require(v, 'lazy')
-        end
-    end
-end
-
----@param name string
----@param code string
----@param file_os_path string
----@param mode RequireTypes
-function Bundler:_process_write(name, code, file_os_path, mode)
-    print('Processing: ' .. file_os_path)
-    self:_write_to_template(name, code, mode)
-end
-
----@param path string
----@param content string
-function Bundler:_write_to_file(path, content)
-    local file, err = io.open(path, "w")
-    if not file then
-        error("\nError opening file: " .. err)
-        return
-    end
-    file:write(content)
-    file:close()
-end
-
----@param name string
----@param content string
----@param mode RequireTypes
-function Bundler:_write_to_template(name, content, mode)
-    content = self:_escape_pattern(content)
-    name = self:_escape_pattern(name)
-
-    local code = ''
-    if mode == 'eager' then
-        code = self._eager_module:gsub('{importpath}', name):gsub('{code}', content)
-    else
-        code = self._lazy_module:gsub('{importpath}', name):gsub('{code}', content)
-    end
-
-    self._bundle_header = self._bundle_header .. code
-end
-
----@param str string
-function Bundler:_escape_pattern(str)
-    str = str:gsub("([%[%]%.%+%-%*%?%^%$%(%)%{%}])", "%1")
-    str = str:gsub("%%", "%%%%")
-    return str
-end
-
----@param lua_path string
----@return string
-function Bundler:_path_fixer(lua_path)
-    local separator = '/'
-
-    if self:_get_os_name() == 'windows' then
-        separator = '\\'
-    end
-
-    local result = lua_path:gsub('%.', separator)
-    return result
-end
-
----@param str string
----@return boolean
-function Bundler:_starts_with_quote(str)
-    return str:sub(1, 1) == "'" or str:sub(1, 1) == '"'
-end
-
----@return 'windows' | 'linux'
-function Bundler:_get_os_name()
+function Bundler:_is_windows()
     if package.config:sub(1, 1) == '\\' then
-        return 'windows'
+        return true
     end
-    return 'linux'
+    return false
 end
 
----@return string
-function Bundler:_getcwd()
-    local cmd = "echo `pwd`"
-
-    if self:_get_os_name() == 'windows' then
-        cmd = 'cd'
-    end
-
-    local handle = io.popen(cmd)
-    if not handle then
-        error("\nCould not get current workdir")
-    end
-    local current_dir = handle:read("*a")
-    handle:close()
-    return current_dir
-end
-
----@param ... string[]
----@return string
-function Bundler:_path_join(...)
-    local final = ''
-    local separator = '/'
-
-    if self:_get_os_name() == 'windows' then
-        separator = '\\'
-    end
-    for _, v in pairs(...) do
-        final = (final .. v .. separator):gsub('\n', '')
-    end
-
-    return final:gsub(separator .. "$", "")
-end
-
----@param path string
----@return boolean
 function Bundler:_file_exists(path)
     local file = io.open(path, "r")
     if file then
         file:close()
         return true
-    else
-        return false
     end
+    return false
 end
 
----@param path string
----@return Tokenizer
-function Bundler:_get_tokenizer(path)
-    local tokenizer = self._collected_modules[path]
-
-    if not tokenizer then
-        self._collected_modules[path] = Tokenizer:new(path)
-        tokenizer = self._collected_modules[path]
-    end
-
-    return tokenizer
+function Bundler:_starts_with(string, prefix)
+    return string.sub(string, 1, #prefix) == prefix
 end
 
-return Bundler:_init()
+function Bundler:_path_fixer(lua_path)
+    local result = lua_path:gsub('%.', self._separator)
+    -- path join
+    local final = ''
+    for _, v in pairs({ self._cwd, result .. '.lua' }) do
+        final = (final .. v .. self._separator):gsub('\n', '')
+    end
+    return final:gsub(self._separator .. "$", "")
+end
 
---#endregion
+function Bundler:_path_to_name(path)
+    return self._prefixsymb .. path:gsub("[%.%/]", "") .. self._postfixsymb
+end
+
+function Bundler:_write_mod_header(mod_name)
+    self:_write_cmt_cmd(self._cmds.skip)
+    self._out:write(
+        'function ' .. mod_name .. '()\n' ..
+        'if _G.__LOADED[' .. mod_name .. '] and _G.__LOADED[' .. mod_name .. '].called then\n' ..
+        'return _G.__LOADED[' .. mod_name .. '].M\n' ..
+        'end\n' ..
+        '_G.__LOADED[' .. mod_name .. '] = {called = true,M = (function()\n'
+    -- mod content goes here
+    )
+    self:_write_cmt_cmd(self._cmds.endskip)
+end
+
+function Bundler:_write_mod_footer(mod_name)
+    self:_write_cmt_cmd(self._cmds.skip)
+    self._out:write(
+        'end)()\n' ..
+        '}\n' ..
+        'return _G.__LOADED[' .. mod_name .. '].M\n' ..
+        'end\n'
+    )
+    self:_write_cmt_cmd(self._cmds.endskip)
+end
+
+function Bundler:_write_cmt_cmd(cmd)
+    self._out:write(self:_get_cmt_cmd(cmd))
+end
+
+function Bundler:_match_cmt_cmd(cmd, line)
+    return line == self:_get_cmt_cmd(cmd, true)
+end
+
+function Bundler:_get_cmt_cmd(cmtcmd, nnl)
+    local cmd = self._cmt_cmd_prefix .. ' ' .. cmtcmd
+    if nnl then
+        return cmd
+    end
+    return cmd .. '\n'
+end
+
+return Bundler
+
+--
+-- Types
+--
+---@class Bundler
+---@field _cwd string
+---@field _config? Config
+---@field _separator string
+---@field _prefixsymb string
+---@field _postfixsymb string
+---@field _cmt_cmd_prefix string
+---@field _out file*
+---@field _entryfile file*
+---@field _cmds CommentCmd
+---@field _reg Regex
+---@field bundle fun(self: Bundler, pwd: string, entrypoint: string, out: string, config?: Config): nil
+---@field _initialize fun(self: Bundler, pwd: string, entrypoint: string, out: string, config: Config): nil
+---@field _get_cmt_cmd fun(self: Bundler, cmtcmd: string, nnl?: boolean): string
+---@field _match_cmt_cmd fun(self: Bundler, cmd: string, line: string): boolean
+---@field _write_cmt_cmd fun(self: Bundler, cmd: string): nil
+---@field _write_mod_header fun(self: Bundler, mod_name: string): nil
+---@field _write_mod_footer fun(self: Bundler, mod_name: string): nil
+---@field _path_to_name fun(self: Bundler, path: string): string
+---@field _path_fixer fun(self: Bundler, lua_path: string): string
+---@field _starts_with fun(self: Bundler, str: string, prefix: string): boolean
+---@field _file_exists fun(self: Bundler, path: string): boolean | nil
+---@field _is_windows fun(self: Bundler): boolean
+---
+---@class CommentCmd
+---@field skip string
+---@field endskip string
+---
+---@class Regex
+---@field emptyline string
+---@field spacecomment string
+---@field space string
+---@field require { noparenthesis: string, parenthesis: string }
+---
+---@class Config
+---@field libname? string
+--@field env? table -- TO DO
