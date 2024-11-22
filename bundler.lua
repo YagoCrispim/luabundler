@@ -1,5 +1,6 @@
 ---@class Bundler
 local Bundler = {
+    _now = os.time(),
     _cwd = '',
     _config = {},
     _separator = '/',
@@ -36,8 +37,11 @@ function Bundler:bundle(pwd, entrypoint, out, config)
 
     while #files_queue > 0 do
         local data = table.remove(files_queue, #files_queue)
+
+        print('Processing: ' .. data.ospath)
+
         local expect_comment_close = false
-        local mod_name = self:_path_to_name(self._config.libname or data.path)
+        local mod_name = self:_concat_suffix(self:_path_to_name(self._config.libname or data.path))
 
         self:_write_mod_header(mod_name)
 
@@ -91,13 +95,14 @@ function Bundler:bundle(pwd, entrypoint, out, config)
                     if self:_file_exists(ospath) then
                         table.insert(files_queue, {
                             path = path,
-                            file = io.open(ospath)
+                            file = io.open(ospath),
+                            ospath = ospath,
                         })
                     end
                 end
 
                 if self:_file_exists(ospath) then
-                    local name = self:_path_to_name(path)
+                    local name = self:_concat_suffix(self:_path_to_name(path))
                     line = (line
                         :gsub("require%s*%(%s*['\"]([^'\"]+)['\"]%s*%)", name)
                         :gsub("require%s+['\"]([^'\"]+)['\"]", name)
@@ -115,7 +120,14 @@ function Bundler:bundle(pwd, entrypoint, out, config)
     end
 
     self:_write_cmt_cmd(self._cmds.skip)
-    self._out:write('return ' .. self._prefixsymb .. (self._config.libname or 'main') .. self._postfixsymb .. '()\n')
+    local mainfn_name = 'main__'
+
+    if self._config.libname then
+        mainfn_name = self._config.libname .. '__'
+    end
+
+    self._out:write('return ' ..
+        self._prefixsymb .. self:_concat_suffix(mainfn_name) .. '()\n')
     self:_write_cmt_cmd(self._cmds.endskip)
     self._out:close()
 end
@@ -129,7 +141,8 @@ function Bundler:_initialize(pwd, entrypoint, out, config)
     self._out = io.open(out, 'a') --[[ @as file* ]]
     self._entryfile = {
         path = 'main',
-        file = io.open(pwd .. self._separator .. entrypoint, 'r')
+        file = io.open(pwd .. self._separator .. entrypoint, 'r'),
+        ospath = pwd .. '/' .. entrypoint
     }
 end
 
@@ -155,7 +168,6 @@ end
 
 function Bundler:_path_fixer(lua_path)
     local result = lua_path:gsub('%.', self._separator)
-    -- path join
     local final = ''
     for _, v in pairs({ self._cwd, result .. '.lua' }) do
         final = (final .. v .. self._separator):gsub('\n', '')
@@ -207,12 +219,17 @@ function Bundler:_get_cmt_cmd(cmtcmd, nnl)
     return cmd .. '\n'
 end
 
+function Bundler:_concat_suffix(mod_name)
+    return mod_name .. self._now .. self._postfixsymb .. 'bt'
+end
+
 return Bundler
 
 --
 -- Types
 --
 ---@class Bundler
+---@field _now integer
 ---@field _cwd string
 ---@field _config? Config
 ---@field _separator string
@@ -235,6 +252,7 @@ return Bundler
 ---@field _starts_with fun(self: Bundler, str: string, prefix: string): boolean
 ---@field _file_exists fun(self: Bundler, path: string): boolean | nil
 ---@field _is_windows fun(self: Bundler): boolean
+---@field _concat_suffix fun(self: Bundler, mod_name: string): string
 ---
 ---@class CommentCmd
 ---@field skip string
