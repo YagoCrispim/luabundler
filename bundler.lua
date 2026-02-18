@@ -19,6 +19,14 @@ local Bundler = {
 }
 
 function Bundler:bundle(pwd, entrypoint, out)
+    if not pwd then
+        error("Project workdir (pwd) is not set.")
+    elseif not entrypoint then
+        error("Entrypoint is not set.")
+    elseif not out then
+        error("Output destination (out) is not set.")
+    end
+
     self:_initialize(pwd, entrypoint, out)
 
     local collected_paths = {}
@@ -51,7 +59,8 @@ function Bundler:bundle(pwd, entrypoint, out)
             end
 
             if continue then
-                local iscomment = self:_starts_with(line, '--')
+                -- preserve doc comments
+                local iscomment = self:_starts_with(line, '--') and not self:_starts_with(line, '---')
                 local isempty = line:match(self._reg.emptyline) ~= nil
 
                 if iscomment or isempty then
@@ -125,7 +134,13 @@ function Bundler:_initialize(pwd, entrypoint, out)
         self:_create_missing_dirs(out)
     end
 
-    self._out = io.open(out, 'a') --[[ @as file* ]]
+    if not self:_file_exists(out) then
+        error('Could not open output file: ' .. out)
+    end
+
+    local outdir = io.open(out, 'a') --[[ @as file* ]]
+
+    self._out = outdir
 
     local file = io.open(pwd .. self._separator .. entrypoint, 'r')
 
@@ -215,8 +230,7 @@ function Bundler:_create_missing_dirs(path)
     end
 end
 
-return Bundler
-
+Bundler:bundle(arg[1], arg[2], arg[3])
 --
 ---@class Bundler
 ---@field private _out file*
